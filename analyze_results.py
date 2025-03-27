@@ -92,6 +92,20 @@ def analyze_match_quality(matches: List[Dict], df: pd.DataFrame) -> Dict:
         "matches_by_country": defaultdict(int),
         "matches_by_industry": defaultdict(int),
         "similarity_distribution": defaultdict(int),
+        "similarity_bins": {
+            "0.90-0.92": 0,
+            "0.93-0.94": 0,
+            "0.95-0.96": 0,
+            "0.97-0.98": 0,
+            "0.99-0.999": 0,
+            "1.0": 0,
+        },
+        "validation_stats": {
+            "country_match": 0,
+            "industry_match": 0,
+            "website_match": 0,
+            "all_fields_match": 0,
+        },
     }
 
     for match in matches:
@@ -116,6 +130,7 @@ def analyze_match_quality(matches: List[Dict], df: pd.DataFrame) -> Dict:
         ].iloc[0]
         if company1_country == company2_country:
             quality_metrics["matches_by_country"][company1_country] += 1
+            quality_metrics["validation_stats"]["country_match"] += 1
 
         # Get industry information using processed names
         company1_industry = df[df["company_name_processed"] == company1_processed][
@@ -126,10 +141,46 @@ def analyze_match_quality(matches: List[Dict], df: pd.DataFrame) -> Dict:
         ].iloc[0]
         if company1_industry == company2_industry:
             quality_metrics["matches_by_industry"][company1_industry] += 1
+            quality_metrics["validation_stats"]["industry_match"] += 1
+
+        # Check website match
+        company1_website = df[df["company_name_processed"] == company1_processed][
+            "website_processed"
+        ].iloc[0]
+        company2_website = df[df["company_name_processed"] == company2_processed][
+            "website_processed"
+        ].iloc[0]
+        if (
+            company1_website
+            and company2_website
+            and company1_website == company2_website
+        ):
+            quality_metrics["validation_stats"]["website_match"] += 1
+
+        # Check if all fields match
+        if (
+            company1_country == company2_country
+            and company1_industry == company2_industry
+            and company1_website
+            and company2_website
+            and company1_website == company2_website
+        ):
+            quality_metrics["validation_stats"]["all_fields_match"] += 1
 
         # Track similarity distribution
-        similarity_bucket = round(match["similarity"], 1)
-        quality_metrics["similarity_distribution"][similarity_bucket] += 1
+        similarity = match["similarity"]
+        if similarity == 1.0:
+            quality_metrics["similarity_bins"]["1.0"] += 1
+        elif similarity >= 0.99:
+            quality_metrics["similarity_bins"]["0.99-0.999"] += 1
+        elif similarity >= 0.97:
+            quality_metrics["similarity_bins"]["0.97-0.98"] += 1
+        elif similarity >= 0.95:
+            quality_metrics["similarity_bins"]["0.95-0.96"] += 1
+        elif similarity >= 0.93:
+            quality_metrics["similarity_bins"]["0.93-0.94"] += 1
+        else:
+            quality_metrics["similarity_bins"]["0.90-0.92"] += 1
 
     return quality_metrics
 
@@ -156,8 +207,24 @@ def print_quality_report(metrics: Dict):
         print(f"{industry}: {count} matches")
 
     print("\nSimilarity Score Distribution:")
-    for score, count in sorted(metrics["similarity_distribution"].items()):
-        print(f"{score:.1f}: {count} matches")
+    for bin_name, count in sorted(metrics["similarity_bins"].items()):
+        percentage = (count / metrics["total_matches"]) * 100
+        print(f"{bin_name}: {count} matches ({percentage:.1f}%)")
+
+    print("\nValidation Statistics:")
+    total_matches = metrics["total_matches"]
+    print(
+        f"Matches with same country: {metrics['validation_stats']['country_match']} ({metrics['validation_stats']['country_match']/total_matches*100:.1f}%)"
+    )
+    print(
+        f"Matches with same industry: {metrics['validation_stats']['industry_match']} ({metrics['validation_stats']['industry_match']/total_matches*100:.1f}%)"
+    )
+    print(
+        f"Matches with same website: {metrics['validation_stats']['website_match']} ({metrics['validation_stats']['website_match']/total_matches*100:.1f}%)"
+    )
+    print(
+        f"Matches with all fields matching: {metrics['validation_stats']['all_fields_match']} ({metrics['validation_stats']['all_fields_match']/total_matches*100:.1f}%)"
+    )
 
 
 def main():

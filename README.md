@@ -97,6 +97,43 @@ After the initial optimizations, the script ran almost instantly, which raised c
    - Different metrics might be needed for different name lengths
    - Need to balance between precision and recall
 
+## Latest match results:
+
+Match Quality Report
+==================================================
+Total number of matches: 2000
+Number of unique companies: 1937
+Exact matches (similarity = 1.0): 1887
+High similarity matches (>= 0.95): 1929
+
+Top 5 Countries by Match Count:
+US: 430 matches
+DE: 212 matches
+GB: 185 matches
+UNKNOWN: 98 matches
+FR: 88 matches
+
+Top 5 Industries by Match Count:
+Restaurants: 44 matches
+Accommodation: 39 matches
+Real Estate - Agents & Managers: 35 matches
+Finishing Contractors: 32 matches
+General Contractors & Heavy Construction: 32 matches
+
+Similarity Score Distribution:
+0.90-0.92: 27 matches (1.4%)
+0.93-0.94: 44 matches (2.2%)
+0.95-0.96: 23 matches (1.1%)
+0.97-0.98: 12 matches (0.6%)
+0.99-0.999: 7 matches (0.4%)
+1.0: 1887 matches (94.3%)
+
+Validation Statistics:
+Matches with same country: 1969 (98.5%)
+Matches with same industry: 1093 (54.6%)
+Matches with same website: 1838 (91.9%)
+Matches with all fields matching: 1029 (51.4%)
+
 ## Future Improvements
 
 Potential areas for further optimization:

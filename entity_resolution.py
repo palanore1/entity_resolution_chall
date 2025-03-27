@@ -403,6 +403,16 @@ def find_matches(df, threshold=0.88):
     # Create blocks
     blocks = create_blocks(df)
 
+    # Industry-specific thresholds
+    industry_thresholds = {
+        "Restaurants": 0.85,  # More lenient for restaurants due to franchise variations
+        "Accommodation": 0.85,
+        "Real Estate - Agents & Managers": 0.90,
+        "Finishing Contractors": 0.92,
+        "General Contractors & Heavy Construction": 0.92,
+        "UNKNOWN": threshold,  # Default threshold for unknown industries
+    }
+
     # Find matches within blocks
     matches = []
     processed_pairs = set()  # Keep track of processed pairs to avoid duplicates
@@ -411,7 +421,7 @@ def find_matches(df, threshold=0.88):
     sorted_blocks = sorted(blocks.items(), key=lambda x: len(x[1]))
 
     # Early stopping if we find too many matches
-    max_matches = 2000  # Increased from 1000 to 2000
+    max_matches = 2000
     if len(matches) >= max_matches:
         return matches
 
@@ -423,14 +433,20 @@ def find_matches(df, threshold=0.88):
         indices_list = list(indices)
 
         # For large blocks, only compare with nearby indices
-        max_comparisons = 25  # Increased from 10 to 25
+        max_comparisons = 25
         for i in range(len(indices_list)):
             idx1 = indices_list[i]
             company1 = df.loc[idx1, "company_name"]
+            industry1 = df.loc[idx1, "main_industry"]
 
             # Skip if company1 is None
             if pd.isna(company1):
                 continue
+
+            # Get industry-specific threshold
+            threshold = industry_thresholds.get(
+                industry1, industry_thresholds["UNKNOWN"]
+            )
 
             # Get all name variations for company1
             name1_variations = df.loc[idx1, "name_variations"].split(" | ")
@@ -439,6 +455,7 @@ def find_matches(df, threshold=0.88):
             for j in range(i + 1, min(i + max_comparisons + 1, len(indices_list))):
                 idx2 = indices_list[j]
                 company2 = df.loc[idx2, "company_name"]
+                industry2 = df.loc[idx2, "main_industry"]
 
                 # Skip if company2 is None
                 if pd.isna(company2):
@@ -491,19 +508,38 @@ def find_matches(df, threshold=0.88):
                         break
 
                 if max_similarity >= threshold:
-                    # Additional checks for high-quality matches
-                    if max_similarity >= 0.95:
-                        # For high similarity matches, check if they're in the same country
-                        country1 = df.loc[idx1, "main_country_code"]
-                        country2 = df.loc[idx2, "main_country_code"]
+                    # Additional validation checks
+                    country1 = df.loc[idx1, "main_country_code"]
+                    country2 = df.loc[idx2, "main_country_code"]
+                    website1 = df.loc[idx1, "website_processed"]
+                    website2 = df.loc[idx2, "website_processed"]
+
+                    # Stricter country validation
+                    if country1 == "UNKNOWN" or country2 == "UNKNOWN":
+                        # Skip matches where either country is unknown
+                        continue
+
+                    # For known countries, require higher similarity if they differ
+                    if country1 != country2:
                         if (
-                            country1 != "UNKNOWN"
-                            and country2 != "UNKNOWN"
-                            and country1 != country2
-                        ):
-                            # If countries don't match, require higher similarity
-                            if max_similarity < 0.98:
-                                continue
+                            max_similarity < 0.98
+                        ):  # Require higher similarity for different countries
+                            continue
+
+                    # Industry validation with hierarchy
+                    if industry1 != "UNKNOWN" and industry2 != "UNKNOWN":
+                        if industry1 != industry2:
+                            # Check if industries are related (e.g., "Restaurants" and "Food Service")
+                            if not are_related_industries(industry1, industry2):
+                                if (
+                                    max_similarity < 0.99
+                                ):  # Require very high similarity for different industries
+                                    continue
+
+                    # Website validation
+                    if website1 and website2 and website1 == website2:
+                        # If websites match, we can be more confident
+                        max_similarity = min(1.0, max_similarity + 0.05)
 
                     matches.append(
                         {
@@ -527,6 +563,29 @@ def find_matches(df, threshold=0.88):
     # Sort matches by similarity score
     matches.sort(key=lambda x: x["similarity"], reverse=True)
     return matches
+
+
+def are_related_industries(industry1: str, industry2: str) -> bool:
+    """Check if two industries are related based on predefined hierarchies."""
+    industry_hierarchies = {
+        "Food Service": ["Restaurants", "Cafes", "Food Service"],
+        "Construction": [
+            "General Contractors & Heavy Construction",
+            "Finishing Contractors",
+            "Construction",
+        ],
+        "Real Estate": [
+            "Real Estate - Agents & Managers",
+            "Real Estate",
+            "Property Management",
+        ],
+        "Hospitality": ["Accommodation", "Hotels", "Hospitality"],
+    }
+
+    for category, industries in industry_hierarchies.items():
+        if industry1 in industries and industry2 in industries:
+            return True
+    return False
 
 
 def create_unique_companies_df(df: pd.DataFrame, matches: List[Dict]) -> pd.DataFrame:
