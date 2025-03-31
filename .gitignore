@@ -1,4 +1,4 @@
-*.parquet
+veridion_entity_resolution_challenge.snappy.parquet
 *.png
 entity_resolution.py
 README1.md
