@@ -1,5 +1,4 @@
 *.parquet
-*.ipynb
 *.png
 entity_resolution.py
 README1.md
