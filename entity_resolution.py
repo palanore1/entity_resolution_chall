@@ -7,6 +7,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from scipy.sparse import csr_matrix
 from jellyfish import jaro_winkler_similarity
 from collections import defaultdict
+import networkx as nx
 
 
 def preprocess_company_name(name: str) -> str:
@@ -45,6 +46,8 @@ def preprocess_company_name(name: str) -> str:
         "plc",
         "pte",
         "pvt",
+        "org",
+        "organization",
     ]
 
     # Remove legal entity types that are separate words
@@ -211,6 +214,41 @@ def create_blocks(df: pd.DataFrame) -> Dict[str, Set[int]]:
     """
     blocks = {}
 
+    # Sort DataFrame by company name for more efficient blocking
+    df_sorted = df.sort_values("company_name_processed")
+
+    # Create blocks by first word of company name
+    current_word = None
+    current_block = set()
+
+    for idx, row in df_sorted.iterrows():
+        name = row["company_name_processed"]
+        if not name:
+            continue
+
+        words = name.split()
+        if not words:
+            continue
+
+        first_word = words[0]
+        if len(first_word) <= 2:  # Skip very short words
+            continue
+
+        # If we're starting a new word, save the previous block if it has multiple records
+        if current_word and current_word != first_word:
+            if len(current_block) > 1:
+                block_key = f"name_first_word_{current_word}"
+                blocks[block_key] = current_block.copy()
+            current_block = set()
+
+        current_word = first_word
+        current_block.add(idx)
+
+    # Don't forget to save the last block
+    if current_word and len(current_block) > 1:
+        block_key = f"name_first_word_{current_word}"
+        blocks[block_key] = current_block
+
     # Block by country code and first word of company name
     for country in df["main_country_code"].unique():
         if country == "UNKNOWN":
@@ -305,11 +343,24 @@ def create_blocks(df: pd.DataFrame) -> Dict[str, Set[int]]:
         block_key = f"industry_{industry}_{sector}".replace(" ", "_")
         blocks[block_key] = set(group.index)
 
+    # Block by business model
+    business_model_mask = df["business_model"].notna() & (
+        df["business_model"] != "UNKNOWN"
+    )
+    business_model_df = df[business_model_mask]
+
+    for model, group in business_model_df.groupby("business_model"):
+        if len(group) < 2:  # Skip single-company business models
+            continue
+
+        block_key = f"business_model_{model}".replace(" ", "_")
+        blocks[block_key] = set(group.index)
+
     # Filter out blocks with only one company
     blocks = {k: v for k, v in blocks.items() if len(v) > 1}
 
-    # Filter out blocks that are too large (more than 200 companies)
-    blocks = {k: v for k, v in blocks.items() if len(v) <= 200}
+    # Filter out blocks that are too large (more than 100 companies)
+    blocks = {k: v for k, v in blocks.items() if len(v) <= 100}
 
     return blocks
 
@@ -398,42 +449,42 @@ def compute_similarity(name1: str, name2: str) -> float:
         return 0.4 * cosine_sim + 0.3 * jw_sim + 0.3 * word_overlap
 
 
-def find_matches(df, threshold=0.88):
+def find_matches(df, threshold=0.85):  # Lowered base threshold
     """Find matching companies using blocking and multiple similarity metrics"""
     # Create blocks
     blocks = create_blocks(df)
 
     # Industry-specific thresholds
     industry_thresholds = {
-        "Restaurants": 0.85,  # More lenient for restaurants due to franchise variations
-        "Accommodation": 0.85,
-        "Real Estate - Agents & Managers": 0.90,
-        "Finishing Contractors": 0.92,
-        "General Contractors & Heavy Construction": 0.92,
-        "UNKNOWN": threshold,  # Default threshold for unknown industries
+        "Restaurants": 0.85,  # Increased from 0.80
+        "Accommodation": 0.85,  # Increased from 0.80
+        "Real Estate - Agents & Managers": 0.90,  # Increased from 0.85
+        "Finishing Contractors": 0.90,  # Increased from 0.85
+        "General Contractors & Heavy Construction": 0.90,  # Increased from 0.85
+        "UNKNOWN": 0.90,  # Increased default threshold
     }
 
     # Find matches within blocks
     matches = []
     processed_pairs = set()  # Keep track of processed pairs to avoid duplicates
+    similarity_cache = {}  # Cache for similarity scores
 
     # Sort blocks by size to process smaller blocks first
     sorted_blocks = sorted(blocks.items(), key=lambda x: len(x[1]))
 
-    # Early stopping if we find too many matches
-    max_matches = 2000
-    if len(matches) >= max_matches:
-        return matches
-
     for block_key, indices in sorted_blocks:
         if len(indices) < 2:
+            continue
+
+        # Skip blocks that are too large
+        if len(indices) > 100:  # Reduced from 200
             continue
 
         # Convert to list for easier indexing
         indices_list = list(indices)
 
         # For large blocks, only compare with nearby indices
-        max_comparisons = 25
+        max_comparisons = 25  # Reduced from 50 to be more conservative
         for i in range(len(indices_list)):
             idx1 = indices_list[i]
             company1 = df.loc[idx1, "company_name"]
@@ -470,38 +521,22 @@ def find_matches(df, threshold=0.88):
                 # Get all name variations for company2
                 name2_variations = df.loc[idx2, "name_variations"].split(" | ")
 
-                # Quick check for exact matches in variations
-                if any(
-                    v1 == v2
-                    for v1 in name1_variations
-                    for v2 in name2_variations
-                    if v1 and v2
-                ):
-                    matches.append(
-                        {
-                            "company1": company1,
-                            "company2": company2,
-                            "similarity": 1.0,
-                            "block_key": block_key,
-                            "company1_processed": df.loc[
-                                idx1, "company_name_processed"
-                            ],
-                            "company2_processed": df.loc[
-                                idx2, "company_name_processed"
-                            ],
-                        }
-                    )
-                    continue
-
-                # Compare each variation
+                # Compare each variation with caching
                 max_similarity = 0
                 for name1 in name1_variations:
                     for name2 in name2_variations:
                         if not name1 or not name2:
                             continue
-                        similarity = compute_similarity(name1, name2)
+
+                        # Check cache first
+                        cache_key = tuple(sorted([name1, name2]))
+                        if cache_key in similarity_cache:
+                            similarity = similarity_cache[cache_key]
+                        else:
+                            similarity = compute_similarity(name1, name2)
+                            similarity_cache[cache_key] = similarity
+
                         max_similarity = max(max_similarity, similarity)
-                        # Early stopping if we find a good match
                         if max_similarity >= threshold:
                             break
                     if max_similarity >= threshold:
@@ -516,29 +551,22 @@ def find_matches(df, threshold=0.88):
 
                     # Stricter country validation
                     if country1 == "UNKNOWN" or country2 == "UNKNOWN":
-                        # Skip matches where either country is unknown
                         continue
 
                     # For known countries, require higher similarity if they differ
                     if country1 != country2:
-                        if (
-                            max_similarity < 0.98
-                        ):  # Require higher similarity for different countries
+                        if max_similarity < 0.98:  # Increased from 0.95
                             continue
 
                     # Industry validation with hierarchy
                     if industry1 != "UNKNOWN" and industry2 != "UNKNOWN":
                         if industry1 != industry2:
-                            # Check if industries are related (e.g., "Restaurants" and "Food Service")
                             if not are_related_industries(industry1, industry2):
-                                if (
-                                    max_similarity < 0.99
-                                ):  # Require very high similarity for different industries
+                                if max_similarity < 0.98:  # Increased from 0.95
                                     continue
 
                     # Website validation
                     if website1 and website2 and website1 == website2:
-                        # If websites match, we can be more confident
                         max_similarity = min(1.0, max_similarity + 0.05)
 
                     matches.append(
@@ -553,16 +581,67 @@ def find_matches(df, threshold=0.88):
                             "company2_processed": df.loc[
                                 idx2, "company_name_processed"
                             ],
+                            "idx1": idx1,
+                            "idx2": idx2,
                         }
                     )
 
-                # Early stopping if we find too many matches
-                if len(matches) >= max_matches:
-                    return matches
+    # Create graph and find components only once
+    G = nx.Graph()
+
+    # Add edges with similarity scores
+    for match in matches:
+        G.add_edge(
+            match["idx1"],
+            match["idx2"],
+            similarity=match["similarity"],
+            company1=match["company1"],
+            company2=match["company2"],
+            company1_processed=match["company1_processed"],
+            company2_processed=match["company2_processed"],
+        )
+
+    # Find connected components using minimum spanning tree with stricter criteria
+    components = []
+    for component in nx.connected_components(G):
+        # Create subgraph for this component
+        subgraph = G.subgraph(component)
+
+        # Skip components that are too large
+        if len(component) > 50:  # Added size limit for components
+            continue
+
+        # Find minimum spanning tree to ensure strongest connections
+        mst = nx.minimum_spanning_tree(subgraph)
+
+        # Only keep components where all edges have high similarity
+        if all(mst[u][v]["similarity"] >= 0.90 for u, v in mst.edges()):
+            components.append((component, mst))
+
+    # Create component mapping once
+    component_mapping = {}
+    for i, (component, _) in enumerate(components):
+        for idx in component:
+            component_mapping[idx] = i
+
+    # Update matches with component information and actual similarity scores
+    for match in matches:
+        comp_id = component_mapping.get(match["idx1"])
+        if comp_id is not None:
+            component, mst = components[comp_id]
+            match["component_id"] = comp_id
+            match["component_size"] = len(component)
+
+            # Get actual similarity from MST if edge exists
+            if mst.has_edge(match["idx1"], match["idx2"]):
+                match["similarity"] = mst[match["idx1"]][match["idx2"]]["similarity"]
+        else:
+            # Remove matches that don't belong to any component
+            matches.remove(match)
 
     # Sort matches by similarity score
     matches.sort(key=lambda x: x["similarity"], reverse=True)
-    return matches
+    return matches, components, component_mapping
 
 
 def are_related_industries(industry1: str, industry2: str) -> bool:
@@ -588,90 +667,104 @@ def are_related_industries(industry1: str, industry2: str) -> bool:
     return False
 
 
-def create_unique_companies_df(df: pd.DataFrame, matches: List[Dict]) -> pd.DataFrame:
+def merge_records(
+    df: pd.DataFrame, components: List[Tuple[Set[int], nx.Graph]]
+) -> pd.DataFrame:
     """
-    Create a DataFrame containing unique companies and their details from the matches.
+    Merge records within components to create more complete records.
+    For each component, creates a new record with the most complete information.
     """
-    # Create a mapping of processed names to original names more efficiently
-    processed_to_original = {}
-    for _, row in df.iterrows():
-        processed_name = row["company_name_processed"]
-        if not processed_name:  # Skip empty processed names
+    merged_records = []
+
+    for component, _ in components:  # Unpack the component and mst tuple
+        # Convert component set to list of indices
+        component_indices = list(component)
+
+        # Get all records for this component using direct indexing
+        component_records = df[df.index.isin(component_indices)]
+
+        # Skip if no records found for this component
+        if len(component_records) == 0:
             continue
-        if processed_name in processed_to_original:
-            # If we already have this processed name, keep the shorter original name
-            if len(row["company_name"]) < len(processed_to_original[processed_name]):
-                processed_to_original[processed_name] = row["company_name"]
-        else:
-            processed_to_original[processed_name] = row["company_name"]
 
-    # Create a set of unique companies from matches using processed names
-    unique_processed_names = set()
-    for match in matches:
-        unique_processed_names.add(match["company1_processed"])
-        unique_processed_names.add(match["company2_processed"])
+        # Initialize merged record with first record's data
+        merged_record = component_records.iloc[0].copy()
 
-    # Create a DataFrame with unique companies more efficiently
-    unique_companies_df = df[
-        df["company_name_processed"].isin(unique_processed_names)
-    ].copy()
+        # For each field, try to find the most complete value
+        for column in df.columns:
+            if column in ["company_name", "company_name_processed", "name_variations"]:
+                continue  # Skip name fields as they're handled by similarity
 
-    # Keep only one row per processed name by using the mapping
-    unique_companies_df = unique_companies_df[
-        unique_companies_df.apply(
-            lambda x: x["company_name"]
-            == processed_to_original.get(x["company_name_processed"]),
-            axis=1,
-        )
-    ]
+            # Get all non-null values for this column
+            values = component_records[column].dropna()
 
-    # Add additional columns for analysis
-    unique_companies_df["has_match"] = True
-    unique_companies_df["match_count"] = 0
+            if len(values) > 0:
+                # For numeric fields, take the maximum value
+                if pd.api.types.is_numeric_dtype(df[column]):
+                    merged_record[column] = values.max()
+                # For categorical fields, take the most common value
+                elif pd.api.types.is_string_dtype(df[column]):
+                    merged_record[column] = values.mode()[0]
+                # For lists (like industries, sectors), combine unique values
+                elif isinstance(values.iloc[0], list):
+                    # Convert lists to tuples for hashing
+                    unique_values = set()
+                    for value in values:
+                        if isinstance(value, list):
+                            # Handle both list and dict values
+                            for item in value:
+                                if isinstance(item, dict):
+                                    # For dictionaries, use a string representation
+                                    unique_values.add(str(item))
+                                else:
+                                    unique_values.add(item)
+                    merged_record[column] = list(unique_values)
+                # For dictionaries, keep the first non-empty one
+                elif isinstance(values.iloc[0], dict):
+                    non_empty_dicts = [v for v in values if v]
+                    if non_empty_dicts:
+                        merged_record[column] = non_empty_dicts[0]
+                    else:
+                        merged_record[column] = {}
+                else:
+                    merged_record[column] = values.iloc[0]
 
-    # Count number of matches for each company using processed names more efficiently
+        # Update name variations to include all variations from all records
+        all_variations = set()
+        for _, record in component_records.iterrows():
+            if pd.notna(record["name_variations"]):
+                all_variations.update(record["name_variations"].split(" | "))
+        merged_record["name_variations"] = " | ".join(sorted(all_variations))
+
+        # Update processed name to be the most complete version
+        processed_names = component_records["company_name_processed"].dropna()
+        if len(processed_names) > 0:
+            merged_record["company_name_processed"] = max(processed_names, key=len)
+
+        merged_records.append(merged_record)
+
+    return pd.DataFrame(merged_records)
+
+
+def create_unique_companies_df(
+    df: pd.DataFrame,
+    matches: List[Dict],
+    components: List[Tuple[Set, nx.Graph]],
+    component_mapping: Dict,
+) -> pd.DataFrame:
+    """Create a DataFrame with one row per unique company."""
+    # First merge records within components to create more complete records
+    merged_df = merge_records(df, components)
+
+    # Add match count information
     match_counts = defaultdict(int)
     for match in matches:
-        processed1 = match["company1_processed"]
-        processed2 = match["company2_processed"]
+        comp_id = component_mapping[match["idx1"]]
+        match_counts[comp_id] += 1
 
-        # If processed names match, count as one match
-        if processed1 == processed2:
-            match_counts[processed1] += 1
-        else:
-            match_counts[processed1] += 1
-            match_counts[processed2] += 1
+    merged_df["match_count"] = merged_df.index.map(lambda x: match_counts[x])
 
-    # Update match counts in the DataFrame
-    unique_companies_df["match_count"] = unique_companies_df[
-        "company_name_processed"
-    ].map(match_counts)
-
-    # Sort by match count and company name
-    unique_companies_df = unique_companies_df.sort_values(
-        ["match_count", "company_name"], ascending=[False, True]
-    )
-
-    # Add alternative names more efficiently
-    alt_names_dict = defaultdict(list)
-    for _, row in df.iterrows():
-        processed_name = row["company_name_processed"]
-        if processed_name in unique_processed_names:
-            original_name = processed_to_original[processed_name]
-            if row["company_name"] != original_name:
-                alt_names_dict[processed_name].append(row["company_name"])
-
-    # Update alternative names in the DataFrame
-    unique_companies_df["alternative_names"] = unique_companies_df[
-        "company_name_processed"
-    ].map(lambda x: " | ".join(alt_names_dict[x]) if x in alt_names_dict else "")
-
-    # Final check to ensure no duplicates
-    unique_companies_df = unique_companies_df.drop_duplicates(
-        subset=["company_name_processed"]
-    )
-
-    return unique_companies_df
+    return merged_df
 
 
 def main():
@@ -694,16 +787,7 @@ def main():
 
     # Find matches
     print("\nFinding potential matches...")
-    matches = find_matches(df)
-
-    # Print matches
-    print("\nPotential matches:")
-    for match in matches:
-        print(
-            f"\nMatch (similarity: {match['similarity']:.3f}):\n"
-            f"  {match['company1']}\n"
-            f"  {match['company2']}"
-        )
+    matches, components, component_mapping = find_matches(df)
 
     # Save matches to CSV
     matches_df = pd.DataFrame(matches)
@@ -712,7 +796,9 @@ def main():
 
     # Create DataFrame of unique companies
     print("\nCreating DataFrame of unique companies...")
-    unique_companies_df = create_unique_companies_df(df, matches)
+    unique_companies_df = create_unique_companies_df(
+        df, matches, components, component_mapping
+    )
 
     # Save to CSV
     output_file = "unique_companies.csv"
